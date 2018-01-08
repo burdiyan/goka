@@ -2,7 +2,11 @@ package storage
 
 import (
 	"fmt"
+	"log"
 	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/syndtr/goleveldb/leveldb"
 	ldbiter "github.com/syndtr/goleveldb/leveldb/iterator"
@@ -58,6 +62,9 @@ type storage struct {
 	db    *leveldb.DB
 	// tx is the transaction used for recovery
 	tx *leveldb.Transaction
+
+	setCounter int64
+	commitLock sync.Mutex
 
 	currentOffset int64
 }
@@ -127,7 +134,33 @@ func (s *storage) GetOffset(defValue int64) (int64, error) {
 	return value, nil
 }
 
+func (s *storage) checkIntermediateTxCommit() error {
+
+	if cnt := atomic.AddInt64(&s.setCounter, 1); cnt%100000 == 0 {
+		if s.store != s.db {
+			s.commitLock.Lock()
+			defer s.commitLock.Unlock()
+			start := time.Now()
+			s.tx.Commit()
+			tx, err := s.db.OpenTransaction()
+			if err != nil {
+				return fmt.Errorf("error opening leveldb transaction: %v", err)
+			}
+			commitTime := time.Since(start)
+			log.Printf("Commiting transaction took %.1fms", float64(commitTime/time.Millisecond))
+			s.tx = tx
+			s.store = tx
+		}
+	}
+	return nil
+
+}
+
 func (s *storage) Set(key string, value []byte) error {
+	if err := s.checkIntermediateTxCommit(); err != nil {
+		return fmt.Errorf("Error executing SET; error commiting intermediate transaction: %v", err)
+	}
+
 	if err := s.store.Put([]byte(key), value, nil); err != nil {
 		return fmt.Errorf("error setting to leveldb (key %s): %v", key, err)
 	}
@@ -155,7 +188,9 @@ func (s *storage) MarkRecovered() error {
 		return nil
 	}
 
-	s.store = s.db
+	defer func() {
+		s.store = s.db
+	}()
 	return s.tx.Commit()
 }
 
